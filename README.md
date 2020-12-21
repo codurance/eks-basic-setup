@@ -1,6 +1,6 @@
 # Steps to Create an EKS Cluster
 
-The setup from the `eksctl-setup` folder is slightly simpler, but a lot less detailed. It was used as a reference to produce the below commands and scripts in conjunction with this blog post: https://aws.amazon.com/blogs/containers/using-alb-ingress-controller-with-amazon-eks-on-fargate/ , and the AWS documentation. Many of the AWS docs have been referenced below.
+The setup from the `eksctl-setup` folder is slightly simpler, but a lot less detailed. It was used as a reference to produce the below commands and scripts in conjunction with this blog post: https://aws.amazon.com/blogs/containers/using-alb-ingress-controller-with-amazon-eks-on-fargate/ , and the AWS documentation: https://docs.aws.amazon.com/eks/latest/userguide/getting-started-console.html. Many of the AWS docs have been referenced below.
 
 - [x] Create a VPC, an EKS Cluster, roles for EKS, and an EKS Fargate Profile.
 
@@ -67,20 +67,17 @@ aws --region $REGION --profile $PROFILE \
 ```bash
 curl -o alb-ingress-iam-policy.json https://raw.githubusercontent.com/kubernetes-sigs/aws-alb-ingress-controller/master/docs/examples/iam-policy.json
 
+ALB_INGRESS_POLICY_NAME=RocheALBIngressControllerIAMPolicy
+
 aws --region $REGION --profile $PROFILE \
   iam create-policy \
-  --policy-name RocheALBIngressControllerIAMPolicy \
+  --policy-name $ALB_INGRESS_POLICY_NAME \
   --policy-document file://alb-ingress-iam-policy.json
 ```
 
 - [x] Create a cluster role, a role binding, and a k8s service account.
 
 ```bash
-VPC_ID=$(aws --region "$REGION" --profile "$PROFILE" \
-  cloudformation describe-stacks \
-  --stack-name "$STACK_NAME" \
-  | jq -r '[.Stacks[0].Outputs[] | {key: .OutputKey, value: .OutputValue}] | from_entries' | jq -r '.VpcId')
-
 AWS_ACCOUNT_ID=$(aws --region "$REGION" --profile "$PROFILE" \
   sts get-caller-identity \
   | jq -r '.Account')
@@ -88,25 +85,65 @@ AWS_ACCOUNT_ID=$(aws --region "$REGION" --profile "$PROFILE" \
 # Update alb-ingress-role.json to use the correct OIDC_PROVIDER_ID and create
 # role with the  previously created RocheALBIngressControllerIAMPolicy.
 # Reference: https://docs.aws.amazon.com/eks/latest/userguide/create-service-account-iam-policy-and-role.html
+PROVIDER_URL_ID=$(aws --region $REGION --profile $PROFILE \
+  eks describe-cluster \
+  --name $CLUSTER_NAME \
+  --query 'cluster.identity.oidc.issuer' \
+  --output text | sed -e 's/.*id\///')
+
+cat > alb-ingress-role.json <<-EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::$AWS_ACCOUNT_ID:oidc-provider/oidc.eks.$REGION.amazonaws.com/id/$(echo $PROVIDER_URL_ID)"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "oidc.eks.$REGION.amazonaws.com/id/$(echo $PROVIDER_URL_ID):sub": "system:serviceaccount:kube-system:alb-ingress-controller",
+          "oidc.eks.$REGION.amazonaws.com/id/$(echo $PROVIDER_URL_ID):aud": "sts.amazonaws.com"
+        }
+      }
+    }
+  ]
+}
+EOF
+
+SERVICE_ACCOUNT_ROLE_NAME=RocheEksClusterServiceAccountRole
+
 aws --region $REGION --profile $PROFILE \
   iam create-role \
-  --role-name RocheEksClusterServiceAccountRole \
+  --role-name $SERVICE_ACCOUNT_ROLE_NAME \
   --assume-role-policy-document file://alb-ingress-role.json
 
 # Attach the RocheALBIngressControllerIAMPolicy to the RocheEksClusterServiceAccountRole.
 aws --region $REGION --profile $PROFILE \
   iam attach-role-policy \
-  --role-name RocheEksClusterServiceAccountRole \
-  --policy-arn=arn:aws:iam::300563897675:policy/RocheALBIngressControllerIAMPolicy
+  --role-name $SERVICE_ACCOUNT_ROLE_NAME \
+  --policy-arn=arn:aws:iam::$AWS_ACCOUNT_ID:policy/$ALB_INGRESS_POLICY_NAME
 
 # Create ClusterRole and ClusterRoleBinding.
 # Reference: https://aws.amazon.com/blogs/containers/using-alb-ingress-controller-with-amazon-eks-on-fargate/
 kubectl apply -f rbac-role.yaml
 
-# Create service account.
-# Edit AWS_ACCOUNT_ID and IAM_ROLE_NAME, i.e., associate the service account with RocheEksClusterServiceAccountRole.
+# Create a service account and associate it with the RocheEksClusterServiceAccountRole.
 # Reference: https://kubernetes.io/docs/tasks/configure-pod-container/configure-service-account/
 # Reference: https://docs.aws.amazon.com/eks/latest/userguide/specify-service-account-role.html
+SERVICE_ACCOUNT_ROLE_ARN=arn:aws:iam::$AWS_ACCOUNT_ID:role/$SERVICE_ACCOUNT_ROLE_NAME
+
+cat > service-account.yaml <<-EOF
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: alb-ingress-controller
+  namespace: kube-system
+  annotations:
+    eks.amazonaws.com/role-arn: $SERVICE_ACCOUNT_ROLE_ARN
+EOF
+
 kubectl apply -f service-account.yaml -n kube-system
 
 # Check if the account has been created.
@@ -116,7 +153,39 @@ kubectl get serviceaccounts/alb-ingress-controller -n kube-system -o yaml
 - [x] Deploy an ALB (Application Load Balancer) Ingress Controller.
 
 ```bash
-# Edit --cluster-name, --aws-vpc-id, and --aws-region in the yaml file.
+VPC_ID=$(aws --region "$REGION" --profile "$PROFILE" \
+  cloudformation describe-stacks \
+  --stack-name "$STACK_NAME" \
+  | jq -r '[.Stacks[0].Outputs[] | {key: .OutputKey, value: .OutputValue}] | from_entries' | jq -r '.VpcId')
+
+cat > alb-ingress-controller.yaml <<-EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app.kubernetes.io/name: alb-ingress-controller
+  name: alb-ingress-controller
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: alb-ingress-controller
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: alb-ingress-controller
+    spec:
+      containers:
+      - name: alb-ingress-controller
+        args:
+        - --ingress-class=alb
+        - --cluster-name=$CLUSTER_NAME
+        - --aws-vpc-id=$VPC_ID
+        - --aws-region=$REGION
+        image: docker.io/amazon/aws-alb-ingress-controller:v1.1.6
+      serviceAccountName: alb-ingress-controller
+EOF
+
 kubectl apply -f alb-ingress-controller.yaml
 ```
 
@@ -145,8 +214,13 @@ kubectl get ingress nginx-ingress
 ```bash
 # The last command should print 'healthy' 3 times. It might take a few retries in the timespan of a few minutes.
 LOADBALANCER_PREFIX=$(kubectl get ingress nginx-ingress -o json | jq -r '.status.loadBalancer.ingress[0].hostname' | cut -d- -f1)
-TARGETGROUP_ARN=$(aws elbv2 describe-target-groups | jq -r '.TargetGroups[].TargetGroupArn' | grep $LOADBALANCER_PREFIX)
-aws elbv2 describe-target-health --target-group-arn $TARGETGROUP_ARN | jq -r '.TargetHealthDescriptions[].TargetHealth.State'
+
+TARGETGROUP_ARN=$(aws --region $REGION --profile $PROFILE \
+  elbv2 describe-target-groups | jq -r '.TargetGroups[].TargetGroupArn' | grep $LOADBALANCER_PREFIX)
+
+aws --region $REGION --profile $PROFILE \
+  elbv2 describe-target-health \
+  --target-group-arn $TARGETGROUP_ARN | jq -r '.TargetHealthDescriptions[].TargetHealth.State'
 
 # Check if all pods are running.
 kubectl get pods -o wide

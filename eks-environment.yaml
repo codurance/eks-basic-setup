@@ -228,7 +228,6 @@ Resources:
         - Key: !Ref RocheTagKey
           Value: !Ref RocheTagValue
 
-
   PublicSubnet01:
     Type: AWS::EC2::Subnet
     Metadata:
