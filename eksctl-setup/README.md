@@ -1,4 +1,4 @@
-# Steps to Create an EKS Cluster with EKSCTL
+# Steps to Create an EKS Cluster with EKSCTL Using Fargate Compute
 
 This README is based on: https://aws.amazon.com/blogs/containers/using-alb-ingress-controller-with-amazon-eks-on-fargate/ .
 

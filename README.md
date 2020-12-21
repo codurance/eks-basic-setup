@@ -1,4 +1,4 @@
-# Steps to Create an EKS Cluster
+# Steps to Create an EKS Cluster With Fargate Compute
 
 The setup from the `eksctl-setup` folder is slightly simpler, but a lot less detailed. It was used as a reference to produce the below commands and scripts in conjunction with this blog post: https://aws.amazon.com/blogs/containers/using-alb-ingress-controller-with-amazon-eks-on-fargate/ , and the AWS documentation: https://docs.aws.amazon.com/eks/latest/userguide/getting-started-console.html. Many of the AWS docs have been referenced below.
 
